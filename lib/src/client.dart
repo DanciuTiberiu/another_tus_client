@@ -980,6 +980,10 @@ class TusClient extends TusClientBase {
 
   bool _pauseUpload = false;
 
+  void set pausedUpload(bool value) {
+    _pauseUpload = value;
+  }
+
   /// The URI on the server for the file
   Uri? get uploadUrl => _uploadUrl;
 

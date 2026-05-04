@@ -259,6 +259,15 @@ class TusUploadManager {
     return id;
   }
 
+  ///Add managed upload
+  void addManagedUpload(ManagedUpload upload) {
+    _uploads[upload.id] = upload;
+    _log('Added to managed uploads map');
+    _uploadEvents
+        .add(UploadEvent(upload: upload, eventType: UploadEventType.add));
+    _log('Emitted add event');
+  }
+
   /// Start a specific upload by ID
   Future<void> startUpload(String id) async {
     _log('Starting upload: $id');

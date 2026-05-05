@@ -989,7 +989,7 @@ class TusClient extends TusClientBase {
   }
 
   void set fileSize(int? value) {
-    _fileSize = _getFileSize();
+    _fileSize = value;
   }
 
   /// The URI on the server for the file

@@ -162,7 +162,7 @@ class TusClient extends TusClientBase {
       // Get file size if not already set
       if (_fileSize == null) {
         _log('File size not set, determining size');
-        _fileSize = await _getFileSize();
+        _fileSize = await getFileSize();
         _log('File size: $_fileSize bytes');
       }
 
@@ -188,7 +188,7 @@ class TusClient extends TusClientBase {
   }
 
   /// Helper method to get the file size consistently across platforms
-  Future<int> _getFileSize() async {
+  Future<int> getFileSize() async {
     _log('Getting file size');
     try {
       if (_file.length is Function) {
@@ -989,7 +989,7 @@ class TusClient extends TusClientBase {
   }
 
   void set fileSize(int? value) {
-    _fileSize = value;
+    _fileSize = _getFileSize();
   }
 
   /// The URI on the server for the file

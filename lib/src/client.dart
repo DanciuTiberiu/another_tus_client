@@ -988,6 +988,10 @@ class TusClient extends TusClientBase {
     _uploadUrl = value;
   }
 
+  void set fileSize(int? value) {
+    _fileSize = value;
+  }
+
   /// The URI on the server for the file
   Uri? get uploadUrl => _uploadUrl;
 

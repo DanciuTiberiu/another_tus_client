@@ -4,3 +4,6 @@ export 'src/store.dart';
 export 'src/retry_scale.dart';
 export 'src/file_utils.dart';
 export 'src/upload_manager.dart';
+export 'src/throttle.dart';
+export 'src/throttle_stats.dart';
+export 'src/speed_probe.dart';

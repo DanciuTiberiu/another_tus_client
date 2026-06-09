@@ -11,7 +11,10 @@ import 'package:universal_io/io.dart';
 
 import 'exceptions.dart';
 import 'package:another_tus_client/src/retry_scale.dart';
+import 'package:another_tus_client/src/throttle.dart';
+import 'package:another_tus_client/src/throttle_stats.dart';
 import 'package:another_tus_client/src/tus_client_base.dart';
+import 'package:another_tus_client/src/speed_probe.dart';
 
 import 'package:crypto/crypto.dart';
 import 'dart:convert';
@@ -26,6 +29,9 @@ class TusClient extends TusClientBase {
   /// [retries] Number of retries for failed uploads
   /// [retryScale] Scaling policy for retry intervals
   /// [retryInterval] Base interval between retries in milliseconds
+  /// [throttle] Optional bandwidth throttle (default: no throttling)
+  /// [speedProbe] Optional speed probe used when `measureUploadSpeed: true`
+  ///   is passed to `upload()`. Defaults to [NoSpeedProbe].
   /// [debug] Optional debug flag for verbose output
   TusClient(
     XFile super.file, {
@@ -34,6 +40,8 @@ class TusClient extends TusClientBase {
     super.retries = 0,
     super.retryScale = RetryScale.constant,
     super.retryInterval = 0,
+    super.throttle = const ThrottleOptions.none(),
+    super.speedProbe = const NoSpeedProbe(),
     this.debug = false,
   }) : _file = file {
 
@@ -59,6 +67,66 @@ class TusClient extends TusClientBase {
   http.Client getHttpClient() => http.Client();
 
   int _actualRetry = 0;
+
+  // Cumulative time we've spent waiting inside the token bucket across
+  // the whole upload. Combined with the number of bytes sent, this gives
+  // the *effective* throughput (bytes/s including throttle waits + wire
+  // time). Reset on each new upload()/resumeUpload() call.
+  int _throttledTotalMicros = 0;
+  int _bytesSentUnderThrottle = 0;
+  final Stopwatch _effectiveSpeedClock = Stopwatch();
+
+  // Reset all throttle bookkeeping. Called at the start of upload() and
+  // _performResume() so per-chunk effective-speed numbers are scoped to
+  // a single logical upload run, not a 2-day-long session.
+  void _resetThrottleStats() {
+    _throttledTotalMicros = 0;
+    _bytesSentUnderThrottle = 0;
+    _effectiveSpeedClock
+      ..reset()
+      ..start();
+  }
+
+  // Log the effective throughput for the bytes we just sent. We compute it
+  // two ways:
+  //  (a) wire-only: total bytes / time since first chunk, ignoring throttle.
+  //  (b) effective: total bytes / (time since first chunk + throttle wait).
+  // (a) shows what the underlying link delivers; (b) shows what the user
+  // actually observes (e.g. "30% of bandwidth" in `bandwidthFraction` mode).
+  void _updateEffectiveSpeedLog(int chunkBytes) {
+    if (!_effectiveSpeedClock.isRunning) return;
+    final elapsedMicros = _effectiveSpeedClock.elapsedMicroseconds;
+    if (elapsedMicros <= 0) return;
+
+    _bytesSentUnderThrottle += chunkBytes;
+    // Delegate the bits-vs-bytes math to ThrottleStats — it's a pure
+    // function we unit-test in test/src/throttle_stats_test.dart so
+    // the conversion can't drift again.
+    final stats = ThrottleStats.fromBytesAndMicros(
+      bytes: _bytesSentUnderThrottle,
+      elapsedMicros: elapsedMicros,
+      throttledMicros: _throttledTotalMicros,
+    );
+    _log(
+      'Throttle stats: sent=${stats.bytes} bytes in '
+      '${(stats.elapsedMicros / 1000).toStringAsFixed(1)}ms '
+      '(+${(stats.throttledMicros / 1000).toStringAsFixed(1)}ms throttled) | '
+      'wire: ${stats.mbpsWire.toStringAsFixed(2)} Mbps '
+      '(${stats.mbPerSecWire.toStringAsFixed(2)} MB/s), '
+      'effective: ${stats.mbpsEffective.toStringAsFixed(2)} Mbps '
+      '(${stats.mbPerSecEffective.toStringAsFixed(2)} MB/s)',
+    );
+  }
+
+  static String _formatBytesPerSecond(double bytesPerSecond) {
+    if (bytesPerSecond >= 1024 * 1024) {
+      return '${(bytesPerSecond / 1024 / 1024).toStringAsFixed(2)} MB/s';
+    }
+    if (bytesPerSecond >= 1024) {
+      return '${(bytesPerSecond / 1024).toStringAsFixed(2)} KB/s';
+    }
+    return '${bytesPerSecond.toStringAsFixed(0)} B/s';
+  }
 
   // Store the callbacks
   Function(double, Duration)? _onProgress;
@@ -240,6 +308,21 @@ class TusClient extends TusClientBase {
     }
   }
 
+  /// **Deprecated.** This method requires the `speed_test_dart` package,
+  /// which uses speedtest.net endpoints that frequently fail on EU IP
+  /// ranges (XmlParserException) and have been broadly deprecated by Ookla.
+  ///
+  /// Use the [speedProbe] field on [TusClientBase] instead:
+  ///
+  /// ```dart
+  /// final client = TusClient(
+  ///   file,
+  ///   speedProbe: DefaultSpeedProbe(),
+  /// );
+  /// await client.upload(uri: endpoint, measureUploadSpeed: true);
+  /// ```
+  @Deprecated('Use the speedProbe field with a DefaultSpeedProbe instead. '
+      'This method still works but speedtest.net endpoints are unreliable.')
   Future<void> setUploadTestServers() async {
     _log('Setting up upload test servers');
     final tester = SpeedTestDart();
@@ -261,6 +344,10 @@ class TusClient extends TusClientBase {
     }
   }
 
+  /// **Deprecated.** See [setUploadTestServers] for the deprecation reason
+  /// and migration path.
+  @Deprecated('Use the speedProbe field with a DefaultSpeedProbe instead. '
+      'This method still works but speedtest.net endpoints are unreliable.')
   Future<void> uploadSpeedTest() async {
     _log('Running upload speed test');
     final tester = SpeedTestDart();
@@ -294,13 +381,25 @@ class TusClient extends TusClientBase {
     Map<String, String>? headers = const {},
     bool measureUploadSpeed = false,
     bool preventDuplicates = true,
+    ThrottleOptions? throttle,
+    SpeedProbe? speedProbe,
   }) async {
     _log('Starting upload process to $uri');
-    _log(
-        'Parameters: measureUploadSpeed=$measureUploadSpeed, preventDuplicates=$preventDuplicates');
 
     setUploadData(uri, headers, metadata);
     _log('Upload data set');
+
+    // Per-call throttle override; fall back to the constructor's value.
+    final effectiveThrottle = throttle ?? this.throttle;
+    _log('Throttle: $effectiveThrottle');
+
+    if(effectiveThrottle != const ThrottleOptions.none()) {
+      speedProbe ??= DefaultSpeedProbe();
+      measureUploadSpeed = true;
+    }
+
+    _log(
+        'Parameters: measureUploadSpeed=$measureUploadSpeed, preventDuplicates=$preventDuplicates');
 
     // Check for duplicates if requested
     if (preventDuplicates) {
@@ -328,8 +427,15 @@ class TusClient extends TusClientBase {
 
     if (measureUploadSpeed) {
       _log('Measuring upload speed');
-      await setUploadTestServers();
-      await uploadSpeedTest();
+      final probe = speedProbe ?? this.speedProbe;
+      _log('Using speed probe: ${probe.runtimeType}');
+      final measured = await probe.measureUploadMbps();
+      if (measured != null) {
+        uploadSpeed = measured;
+        _log('Measured upload speed: $measured Mbps');
+      } else {
+        _log('Speed probe returned null, falling back to elapsed-time estimate');
+      }
     }
 
     if (!_isResumable) {
@@ -376,7 +482,10 @@ class TusClient extends TusClientBase {
       _log('Calling onStart callback');
       Duration? estimate;
       if (uploadSpeed != null) {
-        final _workedUploadSpeed = uploadSpeed! * 1000000;
+        // uploadSpeed is in megabits per second. Convert to bytes per
+        // second by multiplying by 1_000_000 (bits/Mbps) and dividing by
+        // 8 (bits/byte).
+        final _workedUploadSpeed = uploadSpeed! * 1000000 / 8;
         _log('Calculated upload speed: $_workedUploadSpeed bytes/s');
 
         estimate = Duration(
@@ -387,6 +496,14 @@ class TusClient extends TusClientBase {
       // The time remaining to finish the upload
       onStart(this, estimate);
     }
+
+    // Build the throttle bucket now that any speed test has run.
+    final throttleBucket = resolveThrottle(effectiveThrottle, uploadSpeed);
+    _log('Throttle bucket: ${throttleBucket != null ? "enabled" : "disabled"}');
+    if (throttleBucket != null) {
+      _log('Throttle rate: ${_formatBytesPerSecond(throttleBucket.rateTokensPerSecond)}');
+    }
+    _resetThrottleStats();
 
     _log('Starting upload loop');
     while (!_pauseUpload && _offset < totalBytes) {
@@ -423,6 +540,7 @@ class TusClient extends TusClientBase {
         client: client,
         uploadStopwatch: uploadStopwatch,
         totalBytes: totalBytes,
+        throttleBucket: throttleBucket,
       );
     }
 
@@ -480,6 +598,7 @@ class TusClient extends TusClientBase {
     required http.Client client,
     required Stopwatch uploadStopwatch,
     required int totalBytes,
+    TokenBucket? throttleBucket,
   }) async {
     _log(
         'Performing upload chunk: offset=$_offset, maxChunkSize=$maxChunkSize');
@@ -492,6 +611,23 @@ class TusClient extends TusClientBase {
       _log('Reading data chunk');
       request.bodyBytes = await _getData();
       _log('Data chunk size: ${request.bodyBytes.length} bytes');
+
+      // Throttle: wait for the token bucket to accrue enough tokens for
+      // this chunk. We do this *after* reading the bytes (so we know the
+      // actual size) and *before* sending. If the user pauses mid-wait
+      // the next chunk's offset check will catch the inconsistency.
+      if (throttleBucket != null) {
+        final waited = await throttleBucket.acquire(request.bodyBytes.length);
+        _throttledTotalMicros += waited.inMicroseconds;
+        if (waited > Duration.zero) {
+          _log('Throttled chunk by ${waited.inMilliseconds}ms '
+              '(bucket rate: ${_formatBytesPerSecond(throttleBucket.rateTokensPerSecond)})');
+        }
+        // Update the per-chunk effective-speed log so users can see the
+        // actual throughput the upload is achieving *after* the throttle
+        // is applied (not just the configured cap).
+        _updateEffectiveSpeedLog(request.bodyBytes.length);
+      }
 
       _log('Sending PATCH request');
       _response = await client.send(request);
@@ -509,16 +645,20 @@ class TusClient extends TusClientBase {
           onDone: () {
             _log('Response stream completed');
             if (onProgress != null && !_pauseUpload) {
-              // Total byte sent
-              final totalSent = _offset + maxChunkSize;
+              // Total bytes sent so far. _offset is already advanced to
+              // the next unsent byte (the advance happens in _getData()
+              // before the PATCH is sent), so by the time the response
+              // stream's onDone fires, _offset IS the total-sent count.
+              // Don't add maxChunkSize — that would double-count.
+              final totalSent = _offset;
               _log('Total sent: $totalSent / $totalBytes bytes');
 
               double _workedUploadSpeed = 1.0;
 
               // If upload speed != null, it means it has been measured
               if (uploadSpeed != null) {
-                // Multiplied by 10^6 to convert from Mb/s to b/s
-                _workedUploadSpeed = uploadSpeed! * 1000000;
+                // Convert from Mbps to bytes/s: × 1_000_000 (bits) / 8 (bits/byte).
+                _workedUploadSpeed = uploadSpeed! * 1000000 / 8;
                 _log(
                     'Using measured upload speed: $_workedUploadSpeed bytes/s');
               } else {
@@ -618,6 +758,7 @@ class TusClient extends TusClientBase {
         client: client,
         uploadStopwatch: uploadStopwatch,
         totalBytes: totalBytes,
+        throttleBucket: throttleBucket,
       );
     }
   }
@@ -650,6 +791,8 @@ class TusClient extends TusClientBase {
     bool clearStartCallback = false,
     Function()? onComplete,
     bool clearCompleteCallback = false,
+    ThrottleOptions? throttle,
+    SpeedProbe? speedProbe,
   }) async {
     _log('Resuming upload with callbacks management');
 
@@ -684,7 +827,7 @@ class TusClient extends TusClientBase {
 
     // Continue with the upload resumption
     _log('Calling internal resume logic');
-    await _performResume();
+    await _performResume(throttle: throttle, speedProbe: speedProbe);
   }
 
   /// Helper method to clear all callbacks at once
@@ -697,7 +840,10 @@ class TusClient extends TusClientBase {
   }
 
   /// Internal method to handle the actual resumption logic
-  Future<void> _performResume() async {
+  Future<void> _performResume({
+    ThrottleOptions? throttle,
+    SpeedProbe? speedProbe,
+  }) async {
     _log('Performing resume operation');
 
     // Don't resume if already in progress or no upload URL
@@ -705,6 +851,13 @@ class TusClient extends TusClientBase {
       _log('Cannot resume: pauseUpload=$_pauseUpload, uploadUrl=$_uploadUrl');
       return;
     }
+
+    // Resolve effective throttle and speed probe. Per-call overrides win;
+    // otherwise fall back to whatever the constructor was given.
+    final effectiveThrottle = throttle ?? this.throttle;
+    final effectiveSpeedProbe = speedProbe ?? this.speedProbe;
+    _log('Throttle (resume): $effectiveThrottle');
+    _log('Speed probe (resume): ${effectiveSpeedProbe.runtimeType}');
 
     // Reset pause flag
     _log('Resetting pause flag');
@@ -722,6 +875,22 @@ class TusClient extends TusClientBase {
     _offset = await _getOffset();
     _log('Current offset: $_offset');
 
+    // If a speed probe was provided (or a new one for this resume), re-measure
+    // the link. The original upload() may have measured hours ago on a
+    // different network. We only do this if the throttle is bandwidthFraction,
+    // because the other modes don't need a measurement.
+    if (effectiveThrottle is BandwidthFractionThrottle) {
+      _log('Re-measuring upload speed for resume');
+      final measured = await effectiveSpeedProbe.measureUploadMbps();
+      if (measured != null) {
+        uploadSpeed = measured;
+        _log('Re-measured upload speed: $measured Mbps');
+      } else {
+        _log('Speed probe returned null, keeping prior uploadSpeed: '
+            '${this.uploadSpeed} Mbps');
+      }
+    }
+
     // Start a stopwatch for speed calculation
     _log('Starting upload stopwatch');
     final uploadStopwatch = Stopwatch()..start();
@@ -731,7 +900,8 @@ class TusClient extends TusClientBase {
       _log('Calling onStart callback');
       Duration? estimate;
       if (uploadSpeed != null && _fileSize != null) {
-        final _workedUploadSpeed = uploadSpeed! * 1000000;
+        // Convert from Mbps to bytes/s: × 1_000_000 (bits) / 8 (bits/byte).
+        final _workedUploadSpeed = uploadSpeed! * 1000000 / 8;
         _log('Upload speed: $_workedUploadSpeed bytes/s');
 
         estimate = Duration(
@@ -747,6 +917,16 @@ class TusClient extends TusClientBase {
     final client = getHttpClient();
     int totalBytes = _fileSize ?? 0;
     _log('Total bytes: $totalBytes, current offset: $_offset');
+
+    // Build the throttle bucket for the resumed run. Uses the throttle
+    // configured on the constructor and the upload speed measured during
+    // the original upload (if any).
+    final throttleBucket = resolveThrottle(effectiveThrottle, uploadSpeed);
+    _log('Throttle bucket: ${throttleBucket != null ? "enabled" : "disabled"}');
+    if (throttleBucket != null) {
+      _log('Throttle rate: ${_formatBytesPerSecond(throttleBucket.rateTokensPerSecond)}');
+    }
+    _resetThrottleStats();
 
     _log('Starting resume upload loop');
     while (!_pauseUpload && _offset < totalBytes) {
@@ -766,6 +946,7 @@ class TusClient extends TusClientBase {
         client: client,
         uploadStopwatch: uploadStopwatch,
         totalBytes: totalBytes,
+        throttleBucket: throttleBucket,
       );
     }
 

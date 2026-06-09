@@ -66,6 +66,13 @@ class ManagedUpload {
   /// Metadata for this upload
   final Map<String, String>? metadata;
 
+  /// Throttle for this upload (overrides the manager's default).
+  /// Resolved against the file's measured speed when `bandwidthFraction` is used.
+  final ThrottleOptions? throttle;
+
+  /// Speed probe for this upload (overrides the manager's default).
+  final SpeedProbe? speedProbe;
+
   /// This is a unique hash of the file being uploaded
   String get fingerprint => client.fingerprint;
 
@@ -78,6 +85,8 @@ class ManagedUpload {
     this.error,
     this.headers,
     this.metadata,
+    this.throttle,
+    this.speedProbe,
   })  : createdAt = DateTime.now(),
         updatedAt = DateTime.now();
 
@@ -136,6 +145,18 @@ class TusUploadManager {
   final RetryScale retryScale;
   final int retryInterval;
 
+  /// Default throttle for all uploads. Per-upload overrides can be set in
+  /// [addUpload]. The throttle is *per upload*, not global — so with
+  /// `maxConcurrentUploads = 3` and `bandwidthFraction(0.3)`, the manager
+  /// can use up to ~90% of the link when all three slots are active.
+  final ThrottleOptions throttle;
+
+  /// Default speed probe for all uploads. Per-upload overrides can be set
+  /// in [addUpload]. When `measureUploadSpeed: true` is passed and the
+  /// probe returns null, the manager falls back to the elapsed-time
+  /// estimate from each individual upload.
+  final SpeedProbe speedProbe;
+
   /// Stream controller for upload events
   final StreamController<UploadEvent> _uploadEvents =
       StreamController<UploadEvent>.broadcast();
@@ -170,6 +191,8 @@ class TusUploadManager {
     this.retries = 3,
     this.retryScale = RetryScale.exponential,
     this.retryInterval = 2,
+    this.throttle = const ThrottleOptions.none(),
+    this.speedProbe = const NoSpeedProbe(),
     this.debug = false,
   }) {
     _log('TusUploadManager initialized with serverUrl: $serverUrl');
@@ -209,8 +232,18 @@ class TusUploadManager {
     Map<String, String>? metadata,
     Map<String, String>? headers,
     int? chunkSize,
+    ThrottleOptions? throttle,
+    SpeedProbe? speedProbe,
   }) async {
     _log('Adding upload for file: ${file.name}');
+
+    // Per-upload throttle override; fall back to the manager's default.
+    final effectiveThrottle = throttle ?? this.throttle;
+    _log('Throttle: $effectiveThrottle');
+
+    // Per-upload speed probe override; fall back to the manager's default.
+    final effectiveSpeedProbe = speedProbe ?? this.speedProbe;
+    _log('Speed probe: ${effectiveSpeedProbe.runtimeType}');
 
     // Create a TusClient for this file
     final client = TusClient(
@@ -220,6 +253,8 @@ class TusUploadManager {
       retries: retries,
       retryScale: retryScale,
       retryInterval: retryInterval,
+      throttle: effectiveThrottle,
+      speedProbe: effectiveSpeedProbe,
       debug: debug, // Pass the debug flag
     );
 
@@ -236,6 +271,8 @@ class TusUploadManager {
       status: UploadStatus.ready,
       headers: headers, // Store for later reference
       metadata: metadata, // Store for later reference
+      throttle: throttle, // Store for later reference (null = use manager default)
+      speedProbe: speedProbe, // Store for later reference
     );
 
     // Add to our managed uploads
@@ -312,6 +349,8 @@ class TusUploadManager {
         metadata: upload.metadata,
         measureUploadSpeed: measureUploadSpeed,
         preventDuplicates: preventDuplicates,
+        throttle: upload.throttle,
+        speedProbe: upload.speedProbe,
         onStart: (client, estimate) {
           _log(
               'Upload started, estimate: ${estimate?.inSeconds ?? "unknown"} seconds');
@@ -409,6 +448,8 @@ class TusUploadManager {
           _uploadEvents.add(
               UploadEvent(upload: upload, eventType: UploadEventType.progress));
         },
+        throttle: upload.throttle,
+        speedProbe: upload.speedProbe,
         onComplete: () {
           _log('Upload completed successfully after resume: $id');
           upload.updateStatus(UploadStatus.completed);

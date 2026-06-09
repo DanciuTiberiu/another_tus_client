@@ -1,3 +1,26 @@
+## [3.2.7] - Added bandwidth throttling and new speed probe
+
+- New `ThrottleOptions` sealed class with three modes:
+  - `ThrottleOptions.none()` (default — no behavior change)
+  - `ThrottleOptions.bandwidthFraction(0.3)` — "use ~30% of bandwidth"
+  - `ThrottleOptions.bytesPerSecond(2 * 1024 * 1024)` — hard cap
+- New `speedProbe` field on `TusClient` and `TusUploadManager` with a
+  `DefaultSpeedProbe` implementation that hits public echo endpoints
+  (`eu.httpbin.org`, `postman-echo.com`) instead of the deprecated
+  speedtest.net XML config used by `speed_test_dart`.
+- New `TusServerSpeedProbe` that measures throughput by performing a real
+  POST/PATCH/DELETE cycle against your own TUS server. Most accurate
+  option because it includes TLS, auth, and server-side processing. Runs
+  1 warmup probe (silent) + 2 measured probes (best of N), with optional
+  fallback to a different probe (e.g. `DefaultSpeedProbe`) if the TUS
+  server is unreachable.
+- New `FirstSuccessfulSpeedProbe` chain helper for composing primary +
+  fallback probes.
+- `setUploadTestServers()` and `uploadSpeedTest()` are now marked
+  `@Deprecated` — they still work for backward compatibility but the
+  underlying `speedtest.net` endpoints frequently fail with
+  `XmlParserException` on EU IP ranges.
+
 ## [3.2.6] - Fixed an issue with calling cancel via the TUS Upload Manager
 
 - The cancel method now tries to clean up no matter the state of the current upload

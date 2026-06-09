@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:cross_file/cross_file.dart';
 import 'package:speed_test_dart/classes/server.dart';
 import 'package:another_tus_client/another_tus_client.dart';
+import 'package:another_tus_client/src/throttle.dart';
 
 abstract class TusClientBase {
   /// Version of the tus protocol used by the client. The remote server needs to
@@ -33,6 +34,8 @@ abstract class TusClientBase {
     this.retries = 0,
     this.retryScale = RetryScale.constant,
     this.retryInterval = 0,
+    this.throttle = const ThrottleOptions.none(),
+    this.speedProbe = const NoSpeedProbe(),
     this.debug = false,
   });
 
@@ -105,6 +108,21 @@ abstract class TusClientBase {
 
   /// The scale type used to increase the interval of time between every retry.
   final RetryScale retryScale;
+
+  /// Throttling configuration for this client. When [ThrottleOptions.none]
+  /// (the default), the client behaves exactly as before this option existed.
+  final ThrottleOptions throttle;
+
+  /// Speed probe used when `measureUploadSpeed: true` is passed to
+  /// [upload]. The default is [NoSpeedProbe], meaning speed is estimated
+  /// from elapsed time alone. Pass a [DefaultSpeedProbe] (or your own
+  /// implementation) to enable a real measurement.
+  ///
+  /// The legacy `setUploadTestServers()` / `uploadSpeedTest()` methods on
+  /// [TusClient] still work but are deprecated; they require the
+  /// `speed_test_dart` package and frequently fail on EU IP ranges
+  /// (XmlParserException from speedtest.net's consent interstitial).
+  final SpeedProbe speedProbe;
 
   /// Whether the client supports resuming
   bool get resumingEnabled => store != null;

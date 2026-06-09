@@ -15,15 +15,17 @@ Forked from [tus_client_dart](https://pub.dev/packages/tus_client_dart).
 
 - [Usage Examples](#usage-examples)
   - [1. Creating a Client](#1-creating-a-client)
-  - [2. Starting an Upload](#2-starting-an-upload)
-  - [3. Pausing an Upload](#3-pausing-an-upload)
-  - [4. Resuming an Upload](#4-resuming-an-upload)
-  - [5. Canceling an Upload](#5-canceling-an-upload)
-  - [6. Using TusFileStore (Native Platforms)](#6-using-tusfilestore-native-platforms)
-  - [7. Using TusIndexedDBStore (Web)](#7-using-tusindexeddbstore-web)
-  - [8. File Selection on Web](#8-file-selection-on-web)
-  - [9. Using TusUploadManager](#9-using-tusuploadmanager)
-  - [10. Persisting Upload Manager State](#10-persisting-upload-manager-state)
+  - [2. Throttling Bandwidth](#2-throttling-bandwidth)
+  - [3. Measuring Upload Speed Against Your Own TUS Server](#3-measuring-upload-speed-against-your-own-tus-server)
+  - [4. Starting an Upload](#4-starting-an-upload)
+  - [5. Pausing an Upload](#5-pausing-an-upload)
+  - [6. Resuming an Upload](#6-resuming-an-upload)
+  - [7. Canceling an Upload](#7-canceling-an-upload)
+  - [8. Using TusFileStore (Native Platforms)](#8-using-tusfilestore-native-platforms)
+  - [9. Using TusIndexedDBStore (Web)](#9-using-tusindexeddbstore-web)
+  - [10. File Selection on Web](#10-file-selection-on-web)
+  - [11. Using TusUploadManager](#11-using-tusuploadmanager)
+  - [12. Persisting Upload Manager State](#12-persisting-upload-manager-state)
 - [Maintainers](#maintainers)
 
 
@@ -47,7 +49,96 @@ final client = TusClient(
 );
 ```
 
-### 2. Starting an Upload
+### 2. Throttling Bandwidth
+
+The client supports optional bandwidth throttling so your upload doesn't saturate the link (e.g. when uploading a large video on a shared network). Three modes are available:
+
+```dart
+// 1. No throttling (default — current behavior)
+final client = TusClient(file);
+
+// 2. Use ~30% of the measured link speed
+final client = TusClient(
+  file,
+  throttle: ThrottleOptions.bandwidthFraction(0.3),
+);
+
+// 3. Hard cap at 2 MB/s
+final client = TusClient(
+  file,
+  throttle: ThrottleOptions.bytesPerSecond(2 * 1024 * 1024),
+);
+```
+
+`bandwidthFraction` needs a measured upload speed. The client can do this for you by passing a `SpeedProbe`:
+
+```dart
+final client = TusClient(
+  file,
+  throttle: ThrottleOptions.bandwidthFraction(0.3),
+  speedProbe: DefaultSpeedProbe(), // hits eu.httpbin.org / postman-echo.com
+);
+
+await client.upload(
+  uri: Uri.parse('https://your-tus-server.com/files/'),
+  measureUploadSpeed: true, // required for the fraction to take effect
+);
+```
+
+If no probe runs (or it fails), `bandwidthFraction` falls back to a conservative default of 256 KB/s. You can override that:
+
+```dart
+throttle: ThrottleOptions.bandwidthFraction(
+  0.3,
+  fallbackBytesPerSecond: 512 * 1024, // use 512 KB/s if no speed is known
+),
+```
+
+When used with `TusUploadManager` (which runs up to `maxConcurrentUploads` in parallel), the throttle is applied **per upload**, not globally — so with `bandwidthFraction(0.3)` and 3 concurrent uploads, the manager can use up to ~90% of the link.
+
+### 3. Measuring Upload Speed Against Your Own TUS Server
+
+If you want the most accurate speed measurement — one that includes your server's auth, processing, and the real network path to it — use `TusServerSpeedProbe`. It does a real POST/PATCH/DELETE cycle against your TUS server and times the PATCH:
+
+```dart
+final probe = TusServerSpeedProbe(
+  config: TusServerProbeConfig(
+    tusServerUrl: Uri.parse('https://your-tus-server.com/files/'),
+    headers: {'Authorization': 'Bearer your_token'},
+    // Optional: fall back to public echo endpoints if the TUS server
+    // is unreachable.
+    fallback: DefaultSpeedProbe(),
+  ),
+);
+
+final client = TusClient(
+  file,
+  throttle: ThrottleOptions.bandwidthFraction(0.3), // 30% of measured
+  speedProbe: probe,
+);
+
+await client.upload(
+  uri: Uri.parse('https://your-tus-server.com/files/'),
+  measureUploadSpeed: true,
+);
+```
+
+The probe runs **1 silent warmup probe** (to absorb TLS + TCP + auth setup cost) and then **2 measured probes**, keeping the best result. After each measured probe it DELETEs the upload so it doesn't pollute your server's storage.
+
+To compose multiple probes (e.g. TUS first, public echo as last resort):
+
+```dart
+final probe = FirstSuccessfulSpeedProbe([
+  TusServerSpeedProbe(config: TusServerProbeConfig(
+    tusServerUrl: Uri.parse('https://your-tus-server.com/files/'),
+  )),
+  DefaultSpeedProbe(), // public echo endpoints
+]);
+
+final client = TusClient(file, speedProbe: probe);
+```
+
+### 4. Starting an Upload
 
 ```dart
 await client.upload(
